@@ -1,0 +1,642 @@
+---
+title: |
+    | Parametric and Monte Carlo Value-at-Risk for
+    | an equally weighted index portfolio 
+output: pdf_document
+header-includes: 
+- \usepackage{float}
+- \floatplacement{figure}{H} 
+toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Parametric approach
+
+```{r packages, results='hide', message=FALSE, warning=FALSE}
+
+# Load all the necessary libraries
+
+library("VineCopula")
+library("goftest")
+library("KScorrect")
+library("fGarch")
+library("ADGofTest")
+library("tseries")
+library("timeSeries")
+library("zoo")
+
+```
+
+I start by importing the weekly prices for the Nikkei 225 and CAC 40 stock indices.
+
+```{r import, echo = TRUE, results='hide'}
+
+# Get weekly quotes for the Nikkei 225 index and the CAC 40 stock index
+
+price <- get.hist.quote(instrument = "^n225", start = "2000-01-01",
+                        end = "2018-09-21", quote="AdjClose",
+                        compression = "w")
+price2 <- get.hist.quote(instrument = "^fchi", start = "2000-01-01",
+                         end = "2018-09-21", quote="AdjClose",
+                         compression = "w")
+
+# Convert the prices into log returns
+
+y <- diff(log(price))
+x <- diff(log(price2))
+
+# Isolate the data from the dates
+
+y <- coredata(y)
+x <- coredata(x)
+
+```
+
+Now I move onto the implementation of the parametric approach. Assume that each of the weekly log returns, independently and identically (i.i.d) follow a normal distribution, in relation to their corresponding stock index. Meaning, the Nikkei 225 weekly log returns follow one normal distribution i.i.d and the CAC 40 weekly log returns follow another normal distribution i.i.d. We can estimate the two pairs of the mean and variance parameters of the normal distributions through the sample means and sample variances, as these estimators are consistent and the sample at hand is rather large. To calculate the expected return of an equally weighted portfolio containing these two assets, we assign a weight of 0.5 to each asset and sum the multiples of the weights and the estimated mean parameters, giving us the portfolio weekly expected return. The portfolio variance can be calculated by multiplying the covariance matrix obtained from the two samples by the weight vectors in the way seen below in the code, which in this case, as the portfolio is equally weighted, is just the sum of all of the elements in the covariance matrix divided by 4. 
+
+```{r portfolio}
+
+# Calculate mean and weight vectors
+
+mean_vector <- c(mean(y), mean(x))
+weight_vector <- c(0.5, 0.5)
+
+log_return_df <- data.frame(y,x)
+cov_matrix <- cov(log_return_df) # Covariance matrix retrieved from the log returns data
+
+# Calculate the portfolio expected return and variance
+
+combined_var <- t(weight_vector) %*% cov_matrix %*% weight_vector
+combined_mean <- t(weight_vector) %*% mean_vector
+
+```
+
+```{r mean and sd}
+
+# Table containing sample means and standard deviations of index weekly log returns
+
+mean_sd_table <- data.frame(c("Mean", "Standard Deviation"),
+                            c(mean(y), sd(y)), c(mean(x), sd(x)))
+knitr::kable(mean_sd_table, "pipe", col.name = c("", "N225", "FCHI"), align = c("c", "c"),
+  caption = '\\label{tab:tab2}Sample means and standard deviations
+  of weekly log returns (used in later discussion)')
+
+```
+
+Finally, I find the 99% and 95% Value-at-Risk, which is calculated as the product of the quantile of the normal distribution at the corresponding confidence level with the portfolio standard deviation, and subtracted by the portfolio expected return, as done in the code below.
+
+```{r VAR parametric}
+
+# VAR 99%
+
+var_par_99 <-qnorm(0.99)*sqrt(combined_var) - combined_mean
+
+# VAR 95%
+
+var_par_95 <- qnorm(0.95)*sqrt(combined_var) - combined_mean 
+
+```
+
+Below is the table containing the 95% and 99% Value-at-Risk, reported as a positive number.
+
+```{r VAR parametric table}
+
+# Create the table with the results
+
+var_par <- data.frame(c("95%", "99%"), c(var_par_95,var_par_99))
+knitr::kable(var_par, "pipe", col.name = c("VAR", "log return"), align = c("c", "c"),
+             caption = "\\label{tab:tab3}VAR from the parametric approach")
+
+```
+
+Since small log return values are approximately equal to the net returns, we can interpret the VARs above as being 95% confident that our losses from investing in the aforementioned portfolio won't exceed `r round(var_par_95*100, 2)`% over the next week and being 99% confident that our losses from investing in the aforementioned portfolio won't exceed `r round(var_par_99*100, 2)`% over the next week.
+
+Before moving on, it is worth mentioning the advantages and disadvantages of this method.
+
+## Advantages and Disadvantages
+
+An advantage of the parametric approach is its easy implementation. Only two parameters need to be estimated - mean and standard deviation - which can be consistently estimated from the obtained large sample of data. This can then easily be extended into the portfolio variance and expected return, as seen from the basic lines of code above.
+
+A disadvantage of this approach is the i.i.d normality assumption for the distribution of log returns. This assumption is dangerous as it assumes weekly log returns of the same index occur independently of the previous ones, which isn't the case as later exposed through volatility clustering in the time series plots (Figures **\ref{fig:fig2}** & **\ref{fig:fig6}**). Furthermore, clearly a more appropriate distribution of the weekly log returns has fatter tails than a normal distribution, as in the same plots the log returns regularly exceed multiple standard deviations from the means (relevant values in Table **\ref{tab:tab2}**). Finally, the use of the linear correlation coefficient to describe dependency structure of two sets of weekly log returns may result in unreliable and underestimated Value-at-Risk estimates, as joint normality is unlikely since log returns of two major stock indices likely possess some degree of tail dependence, which is supported by similar time series plot shapes. 
+
+# Monte Carlo Simulation
+
+I begin by checking whether the samples are normally distributed using the Jarque-Bera test, which tests the null hypothesis of normality.
+
+[**Note**: I set-up a timer in the code below, using the result in the end discussion]
+
+```{r jarque-bera}
+
+# Set-up a timer to see how long it takes to run - used in end discussion
+
+start <- Sys.time()
+
+# Create a table with the p-values from the Jarque-bera test to check for 
+# normality of weekly log returns
+
+log_return <- c("Nikkei 225", "CAC 40")
+test_results <-c(jarque.bera.test(y)$p.value, jarque.bera.test(x)$p.value)
+table_1 <- data.frame(log_return, test_results)
+knitr::kable(table_1, "pipe", col.name = c("Index", "p-value"), align = c("c", "c"),
+             caption = "\\label{tab:tab4}Jarque-Bera test p-values for the weekly
+             log returns")
+
+```
+
+As the p-values received above are extremely small (essentially 0), there's evidence to reject the null hypothesis, implying there is evidence that the samples are not normally distributed. This naturally warrants further investigation into the structure of log returns, where I will employ the Box-Jenkins approach to decide on the best model that describes the log returns' evolution over time.
+
+I will identify the models for each return separately, beginning with the Nikkei 225 weekly log returns. Below I have constructed the ACF and PACF plots from the Nikkei 225 weekly log returns.
+
+```{r n225 return, fig.height = 6, fig.width = 10.5, fig.cap = "\\label{fig:fig1}ACF and PACF plots from the N225 weekly log returns"}
+
+# ACF and PACF plots from the Nikkei 225 weekly log returns
+
+par(mfrow=c(1,2))
+acf(y, col="green", lwd=2, main = "N225 Weekly Log Returns ACF Plot")
+pacf(y, col="green", lwd=2, main = "N225 Weekly Log Returns PACF Plot") 
+
+```
+
+Before I begin my analysis of any ACF/PACF plots it is worth mentioning that I will ignore lags of above 10, as this is the log return corresponding to 2.5 months ago and it would be sensible to assume that what happened at that time would mostly have an extremely marginal effect on the log return being inspected. What is more, I would potentially be excluding a few too many observations from the analysis, further supporting the ignorance of past 10 lags. Now, from the ACF plot above, it appears that there is no significant autocorrelation before the 10th lag, suggesting that the use of an auto-regressive (AR) model is not necessary. This is also supported by the PACF plot above which normally exposes the order of an AR model, however evidently in this case, tells us that no lags before 10 are statistically significant, while itself not exhibiting geometric decay characteristic of an MA model. Therefore, I am inclined to exclude an ARMA model from the structure of Nikkei 225 weekly log returns, as that is what the evidence points to.
+
+I now move on to checking whether a GARCH model would be necessary. I plot the corresponding weekly log returns against time below, through which we can clearly observe volatility clustering - large changes in log returns are followed by large changes while small changes are followed by small ones. This indicates that variance is not constant and is likely auto-correlated, however I still construct an ACF plot of squared log returns below to confirm the suspicions.
+
+```{r n225 squared returns, fig.height = 6, fig.width = 10.5, fig.cap = "\\label{fig:fig2}N225 weekly log return time series plot and ACF plot for N225 squared weekly log returns"}
+
+# Construct N225 time series plot and ACF plot for squared weekly log returns of N225
+
+par(mfrow=c(1,2))
+plot(y, type = "l", main =  "N225 Time Series", ylab = "N225 weekly log returns")
+acf(y^2, col="red", lwd=2, main =  "N225 Squared weekly Log Returns ACF Plot")
+
+```
+
+As expected, volatility is auto-correlated (indicated by the significant correlations above).
+
+Since it has been deduced a GARCH model is needed to most accurately describe the evolution of Nikkei 225 weekly log returns, I test the various orders of GARCH(p,q) models, up to GARCH(3,3), against different conditional distributions. Although in practice the GARCH(1,1) model is much more common that any other GARCH model, I still  decided to test up to GARCH(3,3), choosing to stop there arbitrarily as, on top of there being an extremely large number of possible combinations, choosing a GARCH model of higher order would involve estimating too many parameters, and even if it results in a slightly better fit, perhaps the simpler but slightly worse model would still be preferred in practice, via the principle of parsimony.
+
+Below is the table of the AIC/BIC criteria for each tested model.
+
+```{r model1, include = FALSE}
+
+# Fit GARCH(p,q) models up to GARCH(3,3) for "norm"
+
+model11_norm <- garchFit(formula=~garch(1,1),data=y,trace=F,cond.dist="norm")
+model12_norm <- garchFit(formula=~garch(1,2),data=y,trace=F,cond.dist="norm")
+model13_norm <- garchFit(formula=~garch(1,3),data=y,trace=F,cond.dist="norm")
+model21_norm <- garchFit(formula=~garch(2,1),data=y,trace=F,cond.dist="norm")
+model22_norm <- garchFit(formula=~garch(2,2),data=y,trace=F,cond.dist="norm")
+model23_norm <- garchFit(formula=~garch(2,3),data=y,trace=F,cond.dist="norm")
+model31_norm <- garchFit(formula=~garch(3,1),data=y,trace=F,cond.dist="norm")
+model32_norm <- garchFit(formula=~garch(3,2),data=y,trace=F,cond.dist="norm")
+model33_norm <- garchFit(formula=~garch(3,3),data=y,trace=F,cond.dist="norm")
+
+# Fit GARCH(p,q) models up to GARCH(3,3) for "snorm"
+
+model11_snorm <- garchFit(formula=~garch(1,1),data=y,trace=F,cond.dist="snorm")
+model12_snorm <- garchFit(formula=~garch(1,2),data=y,trace=F,cond.dist="snorm")
+model13_snorm <- garchFit(formula=~garch(1,3),data=y,trace=F,cond.dist="snorm")
+model21_snorm <- garchFit(formula=~garch(2,1),data=y,trace=F,cond.dist="snorm")
+model22_snorm <- garchFit(formula=~garch(2,2),data=y,trace=F,cond.dist="snorm")
+model23_snorm <- garchFit(formula=~garch(2,3),data=y,trace=F,cond.dist="snorm")
+model31_snorm <- garchFit(formula=~garch(3,1),data=y,trace=F,cond.dist="snorm")
+model32_snorm <- garchFit(formula=~garch(3,2),data=y,trace=F,cond.dist="snorm")
+model33_snorm <- garchFit(formula=~garch(3,3),data=y,trace=F,cond.dist="snorm")
+
+# Fit GARCH(p,q) models up to GARCH(3,3) for "ged"
+
+model11_ged  <- garchFit(formula=~garch(1,1),data=y,trace=F,cond.dist="ged")
+model12_ged  <- garchFit(formula=~garch(1,2),data=y,trace=F,cond.dist="ged")
+model13_ged  <- garchFit(formula=~garch(1,3),data=y,trace=F,cond.dist="ged")
+model21_ged  <- garchFit(formula=~garch(2,1),data=y,trace=F,cond.dist="ged")
+model22_ged  <- garchFit(formula=~garch(2,2),data=y,trace=F,cond.dist="ged")
+model23_ged  <- garchFit(formula=~garch(2,3),data=y,trace=F,cond.dist="ged")
+model31_ged  <- garchFit(formula=~garch(3,1),data=y,trace=F,cond.dist="ged")
+model32_ged  <- garchFit(formula=~garch(3,2),data=y,trace=F,cond.dist="ged")
+model33_ged  <- garchFit(formula=~garch(3,3),data=y,trace=F,cond.dist="ged")
+
+# Fit GARCH(p,q) models up to GARCH(3,3) for "sged"
+
+model11_sged  <- garchFit(formula=~garch(1,1),data=y,trace=F,cond.dist="sged")
+model12_sged  <- garchFit(formula=~garch(1,2),data=y,trace=F,cond.dist="sged")
+model13_sged  <- garchFit(formula=~garch(1,3),data=y,trace=F,cond.dist="sged")
+model21_sged  <- garchFit(formula=~garch(2,1),data=y,trace=F,cond.dist="sged")
+model22_sged  <- garchFit(formula=~garch(2,2),data=y,trace=F,cond.dist="sged")
+model23_sged  <- garchFit(formula=~garch(2,3),data=y,trace=F,cond.dist="sged")
+model31_sged  <- garchFit(formula=~garch(3,1),data=y,trace=F,cond.dist="sged")
+model32_sged  <- garchFit(formula=~garch(3,2),data=y,trace=F,cond.dist="sged")
+model33_sged  <- garchFit(formula=~garch(3,3),data=y,trace=F,cond.dist="sged")
+
+# Fit GARCH(p,q) models up to GARCH(3,3) for "std"
+
+model11_std <- garchFit(formula=~garch(1,1),data=y,trace=F,cond.dist="std")
+model12_std <- garchFit(formula=~garch(1,2),data=y,trace=F,cond.dist="std")
+model13_std <- garchFit(formula=~garch(1,3),data=y,trace=F,cond.dist="std")
+model21_std <- garchFit(formula=~garch(2,1),data=y,trace=F,cond.dist="std")
+model22_std <- garchFit(formula=~garch(2,2),data=y,trace=F,cond.dist="std")
+model23_std <- garchFit(formula=~garch(2,3),data=y,trace=F,cond.dist="std")
+model31_std <- garchFit(formula=~garch(3,1),data=y,trace=F,cond.dist="std")
+model32_std <- garchFit(formula=~garch(3,2),data=y,trace=F,cond.dist="std")
+model33_std <- garchFit(formula=~garch(3,3),data=y,trace=F,cond.dist="std")
+
+# Fit GARCH(p,q) models up to GARCH(3,3) for "sstd"
+
+model11_sstd <- garchFit(formula=~garch(1,1),data=y,trace=F,cond.dist="sstd")
+model12_sstd <- garchFit(formula=~garch(1,2),data=y,trace=F,cond.dist="sstd")
+model13_sstd <- garchFit(formula=~garch(1,3),data=y,trace=F,cond.dist="sstd")
+model21_sstd <- garchFit(formula=~garch(2,1),data=y,trace=F,cond.dist="sstd")
+model22_sstd <- garchFit(formula=~garch(2,2),data=y,trace=F,cond.dist="sstd")
+model23_sstd <- garchFit(formula=~garch(2,3),data=y,trace=F,cond.dist="sstd")
+model31_sstd <- garchFit(formula=~garch(3,1),data=y,trace=F,cond.dist="sstd")
+model32_sstd <- garchFit(formula=~garch(3,2),data=y,trace=F,cond.dist="sstd")
+model33_sstd <- garchFit(formula=~garch(3,3),data=y,trace=F,cond.dist="sstd")
+
+garch_names <- c("GARCH(1,1)","GARCH(1,2)","GARCH(1,3)","GARCH(2,1)","GARCH(2,2)","GARCH(2,3)",
+                 "GARCH(3,1)", "GARCH(3,2)","GARCH(3,3)")
+cond_dist <- c("Normal (norm)", "Skew Normal (snorm)", "Generalised Erorr (ged)", "Skew Generalised Error (sged)", "Student-t (std)", "Skew Student-t (sstd)")
+
+# Calculate the AIC value for each model
+
+AIC_value <- c(model11_norm@fit$ics[["AIC"]], model12_norm@fit$ics[["AIC"]], model13_norm@fit$ics[["AIC"]], model21_norm@fit$ics[["AIC"]], model22_norm@fit$ics[["AIC"]], model23_norm@fit$ics[["AIC"]], model31_norm@fit$ics[["AIC"]], model32_norm@fit$ics[["AIC"]], model33_norm@fit$ics[["AIC"]],model11_snorm@fit$ics[["AIC"]], model12_snorm@fit$ics[["AIC"]], model13_snorm@fit$ics[["AIC"]], model21_snorm@fit$ics[["AIC"]], model22_snorm@fit$ics[["AIC"]], model23_snorm@fit$ics[["AIC"]], model31_snorm@fit$ics[["AIC"]], model32_snorm@fit$ics[["AIC"]], model33_snorm@fit$ics[["AIC"]],model11_ged@fit$ics[["AIC"]], model12_ged@fit$ics[["AIC"]], model13_ged@fit$ics[["AIC"]], model21_ged@fit$ics[["AIC"]], model22_ged@fit$ics[["AIC"]], model23_ged@fit$ics[["AIC"]], model31_ged@fit$ics[["AIC"]], model32_ged@fit$ics[["AIC"]], model33_ged@fit$ics[["AIC"]],model11_sged@fit$ics[["AIC"]], model12_sged@fit$ics[["AIC"]], model13_sged@fit$ics[["AIC"]], model21_sged@fit$ics[["AIC"]], model22_sged@fit$ics[["AIC"]], model23_sged@fit$ics[["AIC"]], model31_sged@fit$ics[["AIC"]], model32_sged@fit$ics[["AIC"]], model33_sged@fit$ics[["AIC"]], model11_std@fit$ics[["AIC"]], model12_std@fit$ics[["AIC"]], model13_std@fit$ics[["AIC"]], model21_std@fit$ics[["AIC"]], model22_std@fit$ics[["AIC"]], model23_std@fit$ics[["AIC"]], model31_std@fit$ics[["AIC"]], model32_std@fit$ics[["AIC"]], model33_std@fit$ics[["AIC"]],model11_sstd@fit$ics[["AIC"]], model12_sstd@fit$ics[["AIC"]], model13_sstd@fit$ics[["AIC"]], model21_sstd@fit$ics[["AIC"]], model22_sstd@fit$ics[["AIC"]], model23_sstd@fit$ics[["AIC"]], model31_sstd@fit$ics[["AIC"]], model32_sstd@fit$ics[["AIC"]], model33_sstd@fit$ics[["AIC"]])
+
+# Calculate the BIC value for each model
+
+BIC_value <- c(model11_norm@fit$ics[["BIC"]], model12_norm@fit$ics[["BIC"]], model13_norm@fit$ics[["BIC"]], model21_norm@fit$ics[["BIC"]], model22_norm@fit$ics[["BIC"]], model23_norm@fit$ics[["BIC"]], model31_norm@fit$ics[["BIC"]], model32_norm@fit$ics[["BIC"]], model33_norm@fit$ics[["BIC"]],model11_snorm@fit$ics[["BIC"]], model12_snorm@fit$ics[["BIC"]], model13_snorm@fit$ics[["BIC"]], model21_snorm@fit$ics[["BIC"]], model22_snorm@fit$ics[["BIC"]], model23_snorm@fit$ics[["BIC"]], model31_snorm@fit$ics[["BIC"]], model32_snorm@fit$ics[["BIC"]], model33_snorm@fit$ics[["BIC"]],model11_ged@fit$ics[["BIC"]], model12_ged@fit$ics[["BIC"]], model13_ged@fit$ics[["BIC"]], model21_ged@fit$ics[["BIC"]], model22_ged@fit$ics[["BIC"]], model23_ged@fit$ics[["BIC"]], model31_ged@fit$ics[["BIC"]], model32_ged@fit$ics[["BIC"]], model33_ged@fit$ics[["BIC"]],model11_sged@fit$ics[["BIC"]], model12_sged@fit$ics[["BIC"]], model13_sged@fit$ics[["BIC"]], model21_sged@fit$ics[["BIC"]], model22_sged@fit$ics[["BIC"]], model23_sged@fit$ics[["BIC"]], model31_sged@fit$ics[["BIC"]], model32_sged@fit$ics[["BIC"]], model33_sged@fit$ics[["BIC"]], model11_std@fit$ics[["BIC"]], model12_std@fit$ics[["BIC"]], model13_std@fit$ics[["BIC"]], model21_std@fit$ics[["BIC"]], model22_std@fit$ics[["BIC"]], model23_std@fit$ics[["BIC"]], model31_std@fit$ics[["BIC"]], model32_std@fit$ics[["BIC"]], model33_std@fit$ics[["BIC"]],model11_sstd@fit$ics[["BIC"]], model12_sstd@fit$ics[["BIC"]], model13_sstd@fit$ics[["BIC"]], model21_sstd@fit$ics[["BIC"]], model22_sstd@fit$ics[["BIC"]], model23_sstd@fit$ics[["BIC"]], model31_sstd@fit$ics[["BIC"]], model32_sstd@fit$ics[["BIC"]], model33_sstd@fit$ics[["BIC"]])
+
+# Construct a table to hold all AIC/BIC values for all fitted models
+
+table_2 <- data.frame(rep(garch_names, 6), c(rep(cond_dist[1], 9),rep(cond_dist[2], 9),rep(cond_dist[3], 9),rep(cond_dist[4], 9),rep(cond_dist[5], 9),rep(cond_dist[6], 9)), AIC_value, BIC_value)
+
+```
+
+```{r table 1, echo = FALSE}
+
+knitr::kable(table_2, "pipe", col.name = c("GARCH", "Conditional distribution", "AIC", "BIC"),
+             align = c("c", "c", "c", "c"), caption = "\\label{tab:tab5}AIC/BIC values for
+             different GARCH models and conditional distributions")
+
+```
+
+[**Note:** I have excluded the 'snig' conditional distributions as it cannot be fit to the data. I have also excluded the code from the report as it was too repetitive and long.]
+
+From the above tables we see that the model with the smallest BIC value is a GARCH(1,1) model with a Skew Student-t conditional distribution. Although possessing the lowest BIC values, the GARCH(1,2) model with a Skew Student-t conditional distribution possesses a smaller AIC value. In this instance that the BIC and AIC values do not agree, I lean towards the model with the smaller BIC value, as the model with the smallest AIC value tends to overfit the data, while the BIC penalises higher parameter models if they do not improve the model fit substantially. Moreover, the GARCH(1,1) model is also overwhelmingly used in practice, is a simpler model than its previously mentioned counterpart and ultimately the difference in the AIC value between it and the GARCH(1,2) model is relatively negligible (although the BIC difference is also marginal). Therefore I choose the GARCH(1,1) model and continue with the tests to check the model's adequacy using residual diagnostics.
+
+I begin by calculating the standardised residuals from the aforementioned model and constructing two ACF plots, one of the standardised residuals and the other of the squared standardised residuals.
+
+```{r model1 res test1, fig.height = 6, fig.width = 10.5, fig.cap = "\\label{fig:fig3}N225 ACF plots for standardised residuals and squared standardised residuals"}
+
+# Obtain the standardised residuals and construct corresponding ACF plots
+
+res1 <- residuals(model11_sstd, standardize=TRUE)
+par(mfrow=c(1,2))
+acf(res1, col="green", lwd=2, main = "N225 Standardised Residuals ACF Plot")
+acf(res1^2, col="red", lwd=2, main = "N225 Squared Standardised Residuals ACF Plot")
+
+```
+
+It appears that the model provides a relatively good explanation for the data collected, as none of the lags are statistically significant for the residual ACF plot and most are not significant for the squared residual ACF plot, with all the lags drastically decreasing in significance from before fitting the model. I now proceed with a formal Ljung-Box test, which tests the null that autocorrelation for the first specified number of lags is zero. There are a lot of different opinions about the optimal number of lags that should be tested in the Ljung-Box test, however in this case, a sensible number to choose would be 10, as it is consistent with the previous decision to ignore statistically significant auto-correlation past the 10th lag. The degrees of freedom chosen is the order of the fitted AR model (in this case 0), as this function subtracts "fitdf" from the number of components.
+
+```{r model1 Box-test 1}
+
+# Apply the Ljung-Box tests on the corresponding values
+
+box_test_1 <- Box.test(res1, lag = 10, type = c("Ljung-Box"), fitdf = 0)
+box_test_2 <- Box.test(res1^2, lag = 10, type = c("Ljung-Box"), fitdf = 0)
+
+# Construct a table containing the p-values from the Box tests
+
+res_table <- data.frame(c("Residuals", "Squared Residuals"),
+                        c(box_test_1$p.value, box_test_2$p.value))
+knitr::kable(res_table, "pipe", col.name = c("Ljung-Box test", "p-value"),
+             align = c("c", "c"), caption = "\\label{tab:tab6}Box test
+             p-values for N225")
+
+```
+
+All the p-values above are rather large and pass the tests at the 5% significance level, possessing values of 0.94 and 0.45 for the standardised residuals and squared standardised residuals, respectively.
+
+Finally, I use the estimates of the degrees of freedom and scale parameter of the Skew Student-t distribution obtained from the 'garchFit' function, which were estimated using a max log-likelihood approach, to describe the marginal distribution of the N225 standardised residuals. These estimates are used when transforming the standardised residuals with the corresponding Skew Student-t c.d.f (i.e apply the Probability Integral Transform to the N225 standardised residuals). As the residuals are standardised, I set the mean to 0 and standard deviation to 1. I then construct a histogram of the transformed residuals, noticing that it supports our choice of the marginal distribution for the corresponding residuals, since the histogram looks like one you could obtain from a sample following a standard uniform distribution. This is confirmed through the Kolmogorov-Smirnov test and the Anderson-Darling test, which exhibit relatively large p-values at 5%. These tests essentially test whether the transformed residuals come from a standard uniform distribution, and hence confirm that there is not enough evidence to reject the marginal distribution obtained.
+
+```{r model1 K-s/A-d test1, fig.cap = "\\label{fig:fig4}Histogram of transformed N225 standardised residuals", fig.width= 4, fig.height=4}
+
+# PIT with the Skew Student-t distribution cdf obtained
+
+u_1 <- psstd(res1, mean = 0, 
+             sd = 1, nu = model11_sstd@fit$par[["shape"]], 
+             xi = model11_sstd@fit$par[["skew"]])[2:length(y)]
+
+# Construct the histogram of the transformed residuals
+
+hist(u_1, main = "N225 (PIT)", xlab = "")
+
+# Perform corresponding gof tests
+
+KStest1 <- LcKS(u_1, cdf = "punif")
+ADtest1 <- ad.test(u_1, null="punif")
+
+# Form table with p-values from the above tests
+
+gof_table <- data.frame(c("Kolmogorov-Smirnov", "Anderson-Darling "),
+                        c(KStest1$p.value, as.vector(ADtest1$p.value)))
+knitr::kable(gof_table, "pipe", col.name = c("Test", "p-value"), align = c("c", "c"),
+             caption = "\\label{tab:tab7}P-values for tests testing standard uniformity")
+
+```
+
+Moving on to the CAC 40 weekly log returns, I again construct ACF and PACF plots for the corresponding returns.
+
+```{r fchi returns, fig.height = 6, fig.width = 10.5, fig.cap = "\\label{fig:fig5}ACF and PACF plots from the FCHI weekly log returns"}
+
+# ACF and PACF plots from the CAC 40 weekly log returns
+
+par(mfrow=c(1,2))
+acf(x, col="green", lwd=2, main = "FCHI Weekly Log Returns ACF Plot") 
+pacf(x, col="green", lwd=2, main = "FCHI Weekly Log Returns PACF Plot")
+
+```
+
+From the ACF plot above, we observe some statistically significant auto-correlation before lag 10 and maybe some geometric decay resemblance, suggesting that now in this case, an AR model could be used. Observing the PACF plot, it appears that there are 2 statistically significant lags before 10 - 1 and 7. It seems reasonable to assume that an AR(1) model should be preferred to describe the structure of CAC 40 weekly log returns, as it is the more statistically significant lag. Therefore, I will proceed to the Box-Jenkins approach with an AR(1) model. One could also continue as I do with an AR(7) model as well and then compare the AIC/BIC values collectively, but I choose not to here as the results will be the same anyways.
+
+Similarly to the previous log returns, there's reason to believe that volatility is yet again auto-correlated, as exposed by the clear volatility clustering below from the plot of CAC 40 log returns against time. However, I still look at the ACF plot of squared log returns and formally deduce that volatility is auto-correlated through the statistically significant lags exposed below.
+
+```{r fchi square returns, fig.height = 6, fig.width = 10.5, fig.cap = "\\label{fig:fig6}FCHI weekly log return time series plot and ACF plot for FCHI squared weekly log returns"}
+
+# Construct FCHI time series plot and ACF plot for squared weekly log returns of FCHI
+
+par(mfrow=c(1,2))
+plot(x, type = "l", main = 'FCHI Time Series', ylab = 'FCHI weekly log returns')
+acf(x^2, col="red", lwd=2, main =  "FCHI Squared Weekly Log Returns ACF Plot")
+```
+
+I again test all GARCH models up to GARCH(3,3), for the same reasons. Below is the table of the AIC and BIC values for the corresponding GARCH models with an AR(1) model.
+
+```{r model2, include = FALSE}
+
+# Fit GARCH(p,q) models up to GARCH(3,3) with AR(1) for "norm"
+
+model111_norm <- garchFit(formula=~arma(1,0) + garch(1,1),data=x,trace=F,cond.dist="norm")
+model112_norm <- garchFit(formula=~arma(1,0) + garch(1,2),data=x,trace=F,cond.dist="norm")
+model113_norm <- garchFit(formula=~arma(1,0) + garch(1,3),data=x,trace=F,cond.dist="norm")
+model121_norm <- garchFit(formula=~arma(1,0) + garch(2,1),data=x,trace=F,cond.dist="norm")
+model122_norm <- garchFit(formula=~arma(1,0) + garch(2,2),data=x,trace=F,cond.dist="norm")
+model123_norm <- garchFit(formula=~arma(1,0) + garch(2,3),data=x,trace=F,cond.dist="norm")
+model131_norm <- garchFit(formula=~arma(1,0) + garch(3,1),data=x,trace=F,cond.dist="norm")
+model132_norm <- garchFit(formula=~arma(1,0) + garch(3,2),data=x,trace=F,cond.dist="norm")
+model133_norm <- garchFit(formula=~arma(1,0) + garch(3,3),data=x,trace=F,cond.dist="norm")
+
+# Fit GARCH(p,q) models up to GARCH(3,3) with AR(1) for "snorm"
+
+model111_snorm <- garchFit(formula=~arma(1,0) + garch(1,1),data=x,trace=F,cond.dist="snorm")
+model112_snorm <- garchFit(formula=~arma(1,0) + garch(1,2),data=x,trace=F,cond.dist="snorm")
+model113_snorm <- garchFit(formula=~arma(1,0) + garch(1,3),data=x,trace=F,cond.dist="snorm")
+model121_snorm <- garchFit(formula=~arma(1,0) + garch(2,1),data=x,trace=F,cond.dist="snorm")
+model122_snorm <- garchFit(formula=~arma(1,0) + garch(2,2),data=x,trace=F,cond.dist="snorm")
+model123_snorm <- garchFit(formula=~arma(1,0) + garch(2,3),data=x,trace=F,cond.dist="snorm")
+model131_snorm <- garchFit(formula=~arma(1,0) + garch(3,1),data=x,trace=F,cond.dist="snorm")
+model132_snorm <- garchFit(formula=~arma(1,0) + garch(3,2),data=x,trace=F,cond.dist="snorm")
+model133_snorm <- garchFit(formula=~arma(1,0) + garch(3,3),data=x,trace=F,cond.dist="snorm")
+
+# Fit GARCH(p,q) models up to GARCH(3,3) with AR(1) for "ged"
+
+model111_ged <- garchFit(formula=~arma(1,0) + garch(1,1),data=x,trace=F,cond.dist="ged")
+model112_ged  <- garchFit(formula=~arma(1,0) + garch(1,2),data=x,trace=F,cond.dist="ged")
+model113_ged  <- garchFit(formula=~arma(1,0) + garch(1,3),data=x,trace=F,cond.dist="ged")
+model121_ged  <- garchFit(formula=~arma(1,0) + garch(2,1),data=x,trace=F,cond.dist="ged")
+model122_ged  <- garchFit(formula=~arma(1,0) + garch(2,2),data=x,trace=F,cond.dist="ged")
+model123_ged  <- garchFit(formula=~arma(1,0) + garch(2,3),data=x,trace=F,cond.dist="ged")
+model131_ged  <- garchFit(formula=~arma(1,0) + garch(3,1),data=x,trace=F,cond.dist="ged")
+model132_ged  <- garchFit(formula=~arma(1,0) + garch(3,2),data=x,trace=F,cond.dist="ged")
+model133_ged  <- garchFit(formula=~arma(1,0) + garch(3,3),data=x,trace=F,cond.dist="ged")
+
+# Fit GARCH(p,q) models up to GARCH(3,3) with AR(1) for "sged"
+
+model111_sged <- garchFit(formula=~arma(1,0) + garch(1,1),data=x,trace=F,cond.dist="sged")
+model112_sged  <- garchFit(formula=~arma(1,0) + garch(1,2),data=x,trace=F,cond.dist="sged")
+model113_sged  <- garchFit(formula=~arma(1,0) + garch(1,3),data=x,trace=F,cond.dist="sged")
+model121_sged  <- garchFit(formula=~arma(1,0) + garch(2,1),data=x,trace=F,cond.dist="sged")
+model122_sged  <- garchFit(formula=~arma(1,0) + garch(2,2),data=x,trace=F,cond.dist="sged")
+model123_sged  <- garchFit(formula=~arma(1,0) + garch(2,3),data=x,trace=F,cond.dist="sged")
+model131_sged  <- garchFit(formula=~arma(1,0) + garch(3,1),data=x,trace=F,cond.dist="sged")
+model132_sged  <- garchFit(formula=~arma(1,0) + garch(3,2),data=x,trace=F,cond.dist="sged")
+model133_sged  <- garchFit(formula=~arma(1,0) + garch(3,3),data=x,trace=F,cond.dist="sged")
+
+# Fit GARCH(p,q) models up to GARCH(3,3) with AR(1) for "std"
+
+model111_std <- garchFit(formula=~arma(1,0) + garch(1,1),data=x,trace=F,cond.dist="std")
+model112_std <- garchFit(formula=~arma(1,0) + garch(1,2),data=x,trace=F,cond.dist="std")
+model113_std <- garchFit(formula=~arma(1,0) + garch(1,3),data=x,trace=F,cond.dist="std")
+model121_std <- garchFit(formula=~arma(1,0) + garch(2,1),data=x,trace=F,cond.dist="std")
+model122_std <- garchFit(formula=~arma(1,0) + garch(2,2),data=x,trace=F,cond.dist="std")
+model123_std <- garchFit(formula=~arma(1,0) + garch(2,3),data=x,trace=F,cond.dist="std")
+model131_std <- garchFit(formula=~arma(1,0) + garch(3,1),data=x,trace=F,cond.dist="std")
+model132_std <- garchFit(formula=~arma(1,0) + garch(3,2),data=x,trace=F,cond.dist="std")
+model133_std <- garchFit(formula=~arma(1,0) + garch(3,3),data=x,trace=F,cond.dist="std")
+
+# Fit GARCH(p,q) models up to GARCH(3,3) with AR(1) for "sstd"
+
+model111_sstd <- garchFit(formula=~arma(1,0) + garch(1,1),data=x,trace=F,cond.dist="sstd")
+model112_sstd <- garchFit(formula=~arma(1,0) + garch(1,2),data=x,trace=F,cond.dist="sstd")
+model113_sstd <- garchFit(formula=~arma(1,0) + garch(1,3),data=x,trace=F,cond.dist="sstd")
+model121_sstd <- garchFit(formula=~arma(1,0) + garch(2,1),data=x,trace=F,cond.dist="sstd")
+model122_sstd <- garchFit(formula=~arma(1,0) + garch(2,2),data=x,trace=F,cond.dist="sstd")
+model123_sstd <- garchFit(formula=~arma(1,0) + garch(2,3),data=x,trace=F,cond.dist="sstd")
+model131_sstd <- garchFit(formula=~arma(1,0) + garch(3,1),data=x,trace=F,cond.dist="sstd")
+model132_sstd <- garchFit(formula=~arma(1,0) + garch(3,2),data=x,trace=F,cond.dist="sstd")
+model133_sstd <- garchFit(formula=~arma(1,0) + garch(3,3),data=x,trace=F,cond.dist="sstd")
+
+garch_names <- c("GARCH(1,1)","GARCH(1,2)","GARCH(1,3)","GARCH(2,1)","GARCH(2,2)","GARCH(2,3)",
+                 "GARCH(3,1)", "GARCH(3,2)","GARCH(3,3)")
+cond_dist <- c("Normal (norm)", "Skew Normal (snorm)", "Generalised Erorr (ged)", "Skew Generalised Error (sged)", "Student-t (std)", "Skew Student-t (sstd)")
+
+# Calculate the AIC value for each model
+
+AIC_value <- c(model111_norm@fit$ics[["AIC"]], model112_norm@fit$ics[["AIC"]], model113_norm@fit$ics[["AIC"]], model121_norm@fit$ics[["AIC"]], model122_norm@fit$ics[["AIC"]], model123_norm@fit$ics[["AIC"]], model131_norm@fit$ics[["AIC"]], model132_norm@fit$ics[["AIC"]], model133_norm@fit$ics[["AIC"]], model111_snorm@fit$ics[["AIC"]], model112_snorm@fit$ics[["AIC"]], model113_snorm@fit$ics[["AIC"]], model121_snorm@fit$ics[["AIC"]], model122_snorm@fit$ics[["AIC"]], model123_snorm@fit$ics[["AIC"]], model131_snorm@fit$ics[["AIC"]], model132_snorm@fit$ics[["AIC"]], model133_snorm@fit$ics[["AIC"]],model111_ged@fit$ics[["AIC"]], model112_ged@fit$ics[["AIC"]], model113_ged@fit$ics[["AIC"]], model121_ged@fit$ics[["AIC"]], model122_ged@fit$ics[["AIC"]], model123_ged@fit$ics[["AIC"]], model131_ged@fit$ics[["AIC"]], model132_ged@fit$ics[["AIC"]], model133_ged@fit$ics[["AIC"]],model111_sged@fit$ics[["AIC"]], model112_sged@fit$ics[["AIC"]], model113_sged@fit$ics[["AIC"]], model121_sged@fit$ics[["AIC"]], model122_sged@fit$ics[["AIC"]], model123_sged@fit$ics[["AIC"]], model131_sged@fit$ics[["AIC"]], model132_sged@fit$ics[["AIC"]], model133_sged@fit$ics[["AIC"]], model111_std@fit$ics[["AIC"]], model112_std@fit$ics[["AIC"]], model113_std@fit$ics[["AIC"]], model121_std@fit$ics[["AIC"]], model122_std@fit$ics[["AIC"]], model123_std@fit$ics[["AIC"]], model131_std@fit$ics[["AIC"]], model132_std@fit$ics[["AIC"]], model133_std@fit$ics[["AIC"]],model111_sstd@fit$ics[["AIC"]], model112_sstd@fit$ics[["AIC"]], model113_sstd@fit$ics[["AIC"]], model121_sstd@fit$ics[["AIC"]], model122_sstd@fit$ics[["AIC"]], model123_sstd@fit$ics[["AIC"]], model131_sstd@fit$ics[["AIC"]], model132_sstd@fit$ics[["AIC"]], model133_sstd@fit$ics[["AIC"]])
+
+# Calculate the BIC value for each model
+
+BIC_value <- c(model111_norm@fit$ics[["BIC"]], model112_norm@fit$ics[["BIC"]], model113_norm@fit$ics[["BIC"]], model121_norm@fit$ics[["BIC"]], model122_norm@fit$ics[["BIC"]], model123_norm@fit$ics[["BIC"]], model131_norm@fit$ics[["BIC"]], model132_norm@fit$ics[["BIC"]], model133_norm@fit$ics[["BIC"]], model111_snorm@fit$ics[["BIC"]], model112_snorm@fit$ics[["BIC"]], model113_snorm@fit$ics[["BIC"]], model121_snorm@fit$ics[["BIC"]], model122_snorm@fit$ics[["BIC"]], model123_snorm@fit$ics[["BIC"]], model131_snorm@fit$ics[["BIC"]], model132_snorm@fit$ics[["BIC"]], model133_snorm@fit$ics[["BIC"]],model111_ged@fit$ics[["BIC"]], model112_ged@fit$ics[["BIC"]], model113_ged@fit$ics[["BIC"]], model121_ged@fit$ics[["BIC"]], model122_ged@fit$ics[["BIC"]], model123_ged@fit$ics[["BIC"]], model131_ged@fit$ics[["BIC"]], model132_ged@fit$ics[["BIC"]], model133_ged@fit$ics[["BIC"]],model111_sged@fit$ics[["BIC"]], model112_sged@fit$ics[["BIC"]], model113_sged@fit$ics[["BIC"]], model121_sged@fit$ics[["BIC"]], model122_sged@fit$ics[["BIC"]], model123_sged@fit$ics[["BIC"]], model131_sged@fit$ics[["BIC"]], model132_sged@fit$ics[["BIC"]], model133_sged@fit$ics[["BIC"]], model111_std@fit$ics[["BIC"]], model112_std@fit$ics[["BIC"]], model113_std@fit$ics[["BIC"]], model121_std@fit$ics[["BIC"]], model122_std@fit$ics[["BIC"]], model123_std@fit$ics[["BIC"]], model131_std@fit$ics[["BIC"]], model132_std@fit$ics[["BIC"]], model133_std@fit$ics[["BIC"]],model111_sstd@fit$ics[["BIC"]], model112_sstd@fit$ics[["BIC"]], model113_sstd@fit$ics[["BIC"]], model121_sstd@fit$ics[["BIC"]], model122_sstd@fit$ics[["BIC"]], model123_sstd@fit$ics[["BIC"]], model131_sstd@fit$ics[["BIC"]], model132_sstd@fit$ics[["BIC"]], model133_sstd@fit$ics[["BIC"]])
+
+# Construct a table to hold all AIC/BIC values for all fitted models
+
+table_3 <- data.frame(rep(garch_names, 6), c(rep(cond_dist[1], 9),rep(cond_dist[2], 9),rep(cond_dist[3], 9),rep(cond_dist[4], 9),rep(cond_dist[5], 9),rep(cond_dist[6], 9)), AIC_value, BIC_value)
+
+```
+
+```{r table2, echo = FALSE}
+
+knitr::kable(table_3, "pipe", col.name = c("GARCH", "Conditional distribution", "AIC", "BIC"),
+             align = c("c", "c", "c", "c"), caption = "\\label{tab:tab8}AIC/BIC values
+             for an AR(1) model combined with different GARCH models and 
+             conditional distributions")
+
+```
+
+[**Note:** Just like previously I have excluded the 'snig' conditional distributions as it cannot be fit to the data. I have also again excluded the code from the report as it was too repetitive and long.]
+
+Similarly to the Nikkei 225 weekly log returns, a GARCH(1,1) model with a Skew Student-t conditional distribution possesses the smallest BIC value, however this time, it also possesses the smallest AIC value from all the other above models. So I continue to the residual diagnostics with a combination of an AR(1) model and a GARCH(1,1) model, following a Skew Student-t conditional distribution.
+
+Again, I construct two ACF plots, one with the standardised residuals and the other with the squared standardised residuals, both obtained from the corresponding aforementioned model.
+
+```{r model2 res test 2, fig.height = 6, fig.width = 10.5, fig.cap = "\\label{fig:fig7}FCHI ACF plots for standardised residuals and squared standardised residuals"}
+
+# Obtain the standardised residuals and construct corresponding ACF plots
+
+res2 <- residuals(model111_sstd, standardize=TRUE)
+par(mfrow=c(1,2))
+acf(res2, col="green", lwd=2, main = "FCHI Standardised Residuals ACF Plot")
+acf(res2^2, col="red", lwd=2, main = "FCHI Squared Standardised Residuals ACF Plot")
+
+```
+
+Although the ACF plot of the squared residuals looks as though the volatility is no longer auto-correlated, the ACF plot of the residuals appears slightly concerning, as it exposes a convincingly significant lag before the 10th one. I proceed with the formal Ljung-Box test, testing the same number of lags as before for the same reasons, however now using 1 degree of freedom, as I have fit an AR(1) model.
+
+```{r model2 Box-test 2}
+
+# Apply the Ljung-Box tests on the corresponding values
+
+box_test_3 <- Box.test(res2, lag = 10, type = c("Ljung-Box"), fitdf = 1)
+box_test_4 <- Box.test(res2^2, lag = 10, type = c("Ljung-Box"), fitdf = 1)
+
+# Construct a table containing the p-values from the Box-tests
+
+res_tabl2 <- data.frame(c("Residuals", "Squared Residuals"),
+                        c(box_test_3$p.value, box_test_4$p.value))
+knitr::kable(res_tabl2, "pipe", col.name = c("Ljung-Box test", "p-value"),
+             align = c("c", "c"), caption ="\\label{tab:tab9}Box test
+             p-values for FCHI")
+
+```
+
+The concerns are alleviated by the formal tests above, which show two large p-values (0.54, 0.89), essentially stating there is not enough evidence to reject the null of no autocorrelation between the first 10 lags.
+
+Finally, I use the estimates of the degrees of freedom and the scale parameter of the Skew Student-t distribution, obtained from the 'garchFit' function again, and apply the Probability Integral Transform in the same way as previously, but now to the second set of residuals. I again construct a histogram and proceed with the same formal tests. The first observations in the Probability Integral Transforms are lost due to the AR(1) model.
+
+```{r model2 K-S/A-D test 2, fig.cap = "\\label{fig:fig8}Histogram of transformed FCHI standardised residuals", fig.width= 4, fig.height=4}
+
+# PIT with the Skew Student-t distribution cdf obtained
+
+u_2 <- psstd(res2, mean = 0, 
+             sd = 1, nu = model111_sstd@fit$par[["shape"]], 
+             xi = model111_sstd@fit$par[["skew"]])[2:length(x)]
+
+# Construct the histogram of the transformed residuals
+
+hist(u_2, main = 'FCHI (PIT)', xlab ="")
+
+# Perform corresponding gof tests
+
+KStest2 <- LcKS(u_2, cdf = "punif")
+ADtest2 <- ad.test(u_2, null="punif")
+
+# Form table with p-values from the above tests
+
+gof_table2 <- data.frame(c("Kolmogorov-Smirnov", "Anderson-Darling "),
+                         c(KStest2$p.value, as.vector(ADtest2$p.value)))
+knitr::kable(gof_table2, "pipe", col.name = c("Test", "p-value"), align = c("c", "c"),
+             caption = "\\label{tab:tab10}P-values for tests testing standard uniformity")
+
+```
+
+The histogram above looks very convincing and the standard uniformity of the transformed residuals is confirmed by the very large p-values of the corresponding tests. So the marginal distribution of the standardsied FCHI residuals is adequate. Therefore, I have found relatively suitable models to describe the structure of weekly log returns for the indices chosen and so can proceed with the copula modelling.
+
+We know from Sklar's theorem that there exists an appropriate copula that when applied to the two previously obtained residual Probability Integral Transforms, is equal to the joint distribution of the two residuals. Therefore, I find this most appropriate copula using the 'BiCopSelect' function, setting the selection criteria to BIC, to be consistent with previous choices.
+
+```{r copula modelling}
+
+# Implement the BiCopSelect function to find the appropriate copula
+
+model <- BiCopSelect(u_1, u_2, familyset=NA, selectioncrit="BIC",
+                     indeptest=TRUE, level=0.05,se = TRUE)
+model
+
+```
+
+I obtain the Survival Gumbel copula with the above parameter. Therefore, a Survival Gumbel copula with a parameter of 1.61 is the copula that best fits the data.
+
+Now that I have everything I need to calculate the VAR using Monte Carlo simulation, I will create 10000 pairs of observations for the next time step using the dependency described by the obtained copula.
+
+```{r copula sim}
+
+# Simulate 10000 pairs of observations with the appropriate parameters
+
+N <- 10000
+u_sim <- BiCopSim(N, family=model$family, model$par)
+
+```
+
+I now apply the inverse Probability Integral Transform to transform the values from a standard uniform back into the values following their corresponding marginal distributions.
+
+```{r IPIT}
+
+# Apply the inverse probability integral transform
+
+res1_sim <- qsstd(u_sim[,1], mean = 0, sd = 1, nu = model11_sstd@fit$par[["shape"]],
+                  xi = model11_sstd@fit$par[["skew"]]) 
+res2_sim <- qsstd(u_sim[,2], mean = 0, sd = 1, nu = model111_sstd@fit$par[["shape"]],
+                 xi = model111_sstd@fit$par[["skew"]]) 
+
+```
+
+Having obtained the residuals, I reintroduce autocorrelation and GARCH effects observed in the data, doing so in the code below. I find the non-standardised residuals from the two fitted models, and then substitute the necessary values into the corresponding formulas.
+
+```{r GARCH effects}
+
+# Find the non-standardised residuals
+
+res1_non_standard <- residuals(model11_sstd, standardize=FALSE)
+res2_non_standard <- residuals(model111_sstd, standardize=FALSE)
+
+# Reintroduce auto-correlation and GARCH effects
+
+sim_1 <- model11_sstd@fit$par[["mu"]] + sqrt(model11_sstd@fit$par[["omega"]]
++ model11_sstd@fit$par[["alpha1"]] * tail(res1_non_standard, 1) ^ 2
++ model11_sstd@fit$par[["beta1"]] * tail(model11_sstd@fit$series$h, 1)) * res1_sim
+
+sim_2 <- model111_sstd@fit$par[["mu"]] + model111_sstd@fit$par[["ar1"]] * 
+as.vector(tail(x, 1)) + sqrt(model111_sstd@fit$par[["omega"]]
++ model111_sstd@fit$par[["alpha1"]] * tail(res2_non_standard, 1) ^ 2
++ model111_sstd@fit$par[["beta1"]] * tail(model111_sstd@fit$series$h, 1)) * res2_sim
+
+```
+
+Finally, I combine the two separate log returns into one log return and use that to calculate the 95% and 99% VAR, reported in the below table as positive values.
+
+```{r VAR}
+
+# Combine returns into log return
+
+portsim <- log(1+((exp(sim_1)-1)+(exp(sim_2)-1))*(1/2))
+
+# Calculate and form a table with the 95% and 99% VARs
+
+varsim <- quantile(portsim,c(0.05,0.01))
+var_mc <- data.frame(c("95%", "99%"), as.vector(-varsim))
+knitr::kable(var_mc, "pipe", col.name = c("VAR", "log return"), align = c("c", "c"),
+             caption = "\\label{tab:tab11}VAR Monte Carlo simulation approach")
+
+```
+
+We know that small log return values are approximately equal to the net returns, therefore, we can interpret the Value-at-risks above as being 95% confident that losses from investing in the aforementioned portfolio won't exceed `r round(as.vector(-varsim)[1] * 100, 2)`% over the next week and being 99% confident that losses from investing in the aforementioned portfolio won't exceed `r round(as.vector(-varsim)[2] * 100, 2)`% over the next week.
+
+```{r time}
+
+# Time it took to run in seconds
+
+time_to_run <- as.numeric(round(Sys.time() - start, 2), units = 'secs')
+
+```
+
+It is again worth discussing the advantages and disadvantages of this method.
+
+## Advantages and Disadvantages 
+
+An advantage of the Monte Carlo simulation approach is its flexibility. The log returns don't have to be normal, hence we can make far more marginal distribution assumptions by testing, in this case, 6 different conditional distributions and potentially assume a marginal distribution with a more fitting skew and kurtosis for index log returns, as I did with the Skew Student-t. This allows for an appropriate dependency structure for the two weekly log returns, regardless of the separate data structures, hence capturing any tail dependence that is almost definitely present in two major stock indices (exposed through similarity in Figures **\ref{fig:fig2}** & **\ref{fig:fig6}**). As we can proceed even with the non-linear relationship of two stock indices and capture the dependencies within the corresponding index (as seen with the GARCH(1,1) and AR(1) models), we get the most reliable Value-at-Risk estimates of any approach.
+
+A disadvantage of the Monte Carlo simulation approach is its computation time. It took `r time_to_run` seconds to run, clearly indicating the issue with  time. Moreover, the procedure is complicated and time-consuming, requiring to fit and compare 2 sets of 54 models, along with creating and storing the plethora of variables observed in the code above.
+
+# Conclusion
+ 
+The 95% and 99% Value-at-Risk obtained from the parametric approach are `r round(var_par_95*100, 2)`% and `r round(var_par_99*100, 2)`%, respectively and from the Monte Carlo simulation approach - `r round( as.vector(-varsim[1])*100, 2)`%, `r round( as.vector(-varsim[2])*100, 2)`%. The difference between the 95% and 99% VARs for the Monte Carlo approach is greater than in the parametric approach. The extremely small p-values from the Jarque-Bera test from Table **\ref{tab:tab4}**, suggest there is enough evidence to reject the null of normality for the weekly log returns. This indicates the flawed nature of the normality assumption, suggesting the parametric approach is not a sensible choice in this context. In contrast, the Monte Carlo approach makes no such assumption, allowing for far more freedom in conditional distribution assumptions, capturing the appropriate joint dependencies of the log returns regardless of their varying structure. This approach however is more computationally intensive, but this isn't an issue in this case as I do not have any time constraints. Furthermore, simulating 10000 observations means we should largely expect to see similar estimates, meaning the corresponding Value-at-Risk estimates above are reliable. Therefore, I have little reason to choose the parametric approach and hence will measure the riskiness of this portfolio using the Monte Carlo simulation approach.
